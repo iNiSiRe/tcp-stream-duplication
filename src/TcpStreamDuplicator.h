@@ -4,6 +4,7 @@
 #include <iostream>
 #include <sys/socket.h>
 #include <arpa/inet.h>
+#include <memory>
 #include <vector>
 #include <thread>
 #include <chrono>
@@ -12,14 +13,16 @@
 #include <csignal>
 #include <unistd.h>
 #include <mutex>
+#include "SocketClient.h"
 
 using namespace std;
 
 class TcpStreamDuplicator {
 
 private:
-    std::vector<int> clients;
+    std::vector<shared_ptr<SocketClient>> clients;
     std::mutex clients_mutex;
+    std::condition_variable clients_cv;
 
     void accept_connections(int socket_descriptor) {
         while (true) {
@@ -34,9 +37,9 @@ private:
                 continue;
             }
 
-            clients_mutex.lock();
-            clients.push_back(client_descriptor);
-            clients_mutex.unlock();
+            lock_guard<mutex> lock(clients_mutex);
+            clients.push_back(std::make_shared<SocketClient>(client_descriptor));
+            clients_cv.notify_one();
 
             cout << "Accepted new connection" << endl;
         }
@@ -93,43 +96,46 @@ private:
             client_socket = reconnect(host, port);
         }
 
-        while (true) {
-            errno = 0;
-            received_bytes = recv(client_socket, (char*) &msg, sizeof(msg), 0);
+        try {
+            while (true) {
+                errno = 0;
+                received_bytes = recv(client_socket, (char*) &msg, sizeof(msg), 0);
 
-            if (errno != 0) {
-                cout << "An error caused on recv: " << strerror(errno) << endl;
-                close(client_socket);
-                client_socket = reconnect(host, port);
-                continue;
-            }
+                if (errno != 0) {
+                    cout << "An error caused on recv: " << strerror(errno) << endl;
+                    close(client_socket);
+                    client_socket = reconnect(host, port);
+                    continue;
+                }
 
-            if (received_bytes == 0) {
-                cout << "Connection lost with the source server" << endl;
-                close(client_socket);
-                client_socket = reconnect(host, port);
-                continue;
-            }
+                if (received_bytes == 0) {
+                    cout << "Connection lost with the source server" << endl;
+                    close(client_socket);
+                    client_socket = reconnect(host, port);
+                    continue;
+                }
 
-            if (clients.empty()) {
-                this_thread::sleep_for(100ms);
-            } else {
+                if (clients.empty()) {
+                    continue;
+                }
+
+                lock_guard<mutex> lock(clients_mutex);
+
                 for (auto it = clients.begin(); it != clients.end();) {
-                    errno = 0;
-                    send(*it, msg, received_bytes, 0);
-
-                    if (errno != 0) {
-                        cout << "Connection closed" << endl;
-                        close(*it);
-                        clients_mutex.lock();
-                        it = clients.erase(it);
-                        clients_mutex.unlock();
-                    } else {
+                    SocketClient* client = it->get();
+                    if (client->is_connected()) {
+                        client->write(string(msg, received_bytes));
                         it++;
+                    } else {
+                        it = clients.erase(it);
                     }
                 }
             }
+        } catch (std::exception &exception) {
+            cout << "Exception caused: " << exception.what() << endl;
         }
+
+        close(client_socket);
     }
 
 public:
@@ -154,6 +160,7 @@ public:
         int optval = 1;
         setsockopt(socket_descriptor, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
         setsockopt(socket_descriptor, SOL_SOCKET, SO_REUSEPORT, &optval, sizeof(optval));
+        setsockopt(socket_descriptor, SOL_SOCKET, SO_KEEPALIVE, &optval, sizeof(optval));
 
         if (bind(socket_descriptor, (struct sockaddr*) &addr, sizeof(addr)) < 0) {
             cerr << "Error caused on binding socket" << endl;
